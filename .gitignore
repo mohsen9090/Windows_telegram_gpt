@@ -1,0 +1,34 @@
+# Binary files
+/windows_bot
+/Windows_telegram_bot_gpt
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with 'go test -c'
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+/vendor/
+
+# Downloaded files and temp
+/downloads/
+/temp/
+/uploads/
+
+# Environment files
+.env
+*.env
+config.json
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Go workspace file
+go.work

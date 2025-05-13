@@ -1,11 +1,13 @@
+
 package main
 
 import (
-    "archive/zip"
     "bytes"
     "encoding/json"
     "fmt"
     "io"
+    "io/ioutil"
+    "log"
     "net/http"
     "os"
     "path/filepath"
@@ -16,213 +18,145 @@ import (
     "github.com/joho/godotenv"
 )
 
-type File struct {
-    FileID   string `json:"file_id"`
-    FileName string `json:"file_name"`
-}
-
-type Message struct {
-    Text     string  `json:"text"`
-    Chat     struct{ ID int64 } `json:"chat"`
-    Document *File   `json:"document,omitempty"`
-    Photo    []File  `json:"photo,omitempty"`
-    Video    *File   `json:"video,omitempty"`
-    Audio    *File   `json:"audio,omitempty"`
-    Voice    *File   `json:"voice,omitempty"`
-}
-
-type Update struct {
-    UpdateID int     `json:"update_id"`
-    Message  Message `json:"message"`
-}
-
 var (
-    token       string
-    openaiKey   string
-    apiURL      string
-    offset      = 0
-    userModules = make(map[int64]string)
-    userStates  = make(map[int64]bool)
-    uploadDir   string
-    templateDir string
     bot         *tgbotapi.BotAPI
+    userStates  = make(map[int64]string)
+    currentPath = make(map[int64]string)
+    isGPTMode   = make(map[int64]bool)
+    uploadDir   = "uploads"
 )
 
-func sendMessage(chatID int64, text string) {
-    msg := tgbotapi.NewMessage(chatID, text)
-    bot.Send(msg)
+// تابع کمکی برای تبدیل سایز فایل به فرمت خوانا
+func formatSize(size int64) string {
+    if size < 1024 {
+        return fmt.Sprintf("%d B", size)
+    } else if size < 1024*1024 {
+        return fmt.Sprintf("%.1f KB", float64(size)/1024)
+    } else if size < 1024*1024*1024 {
+        return fmt.Sprintf("%.1f MB", float64(size)/1024/1024)
+    }
+    return fmt.Sprintf("%.1f GB", float64(size)/1024/1024/1024)
 }
 
-func sendDocument(chatID int64, fileName, filePath string) {
-    file, err := os.Open(filePath)
-    if err != nil {
-        sendMessage(chatID, "❌ Error opening file")
-        return
-    }
-    defer file.Close()
-
-    doc := tgbotapi.NewDocument(chatID, tgbotapi.FileReader{Name: fileName, Reader: file})
-    _, err = bot.Send(doc)
-    if err != nil {
-        sendMessage(chatID, "❌ Error sending document")
-    }
+// ایجاد کیبورد اصلی
+func createMainKeyboard() tgbotapi.InlineKeyboardMarkup {
+    return tgbotapi.NewInlineKeyboardMarkup(
+        tgbotapi.NewInlineKeyboardRow(
+            tgbotapi.NewInlineKeyboardButtonData("💬 Chat GPT", "gpt_start"),
+            tgbotapi.NewInlineKeyboardButtonData("❌ خروج از GPT", "gpt_exit"),
+        ),
+        tgbotapi.NewInlineKeyboardRow(
+            tgbotapi.NewInlineKeyboardButtonData("📁 مدیریت فایل سرور", "server_files"),
+            tgbotapi.NewInlineKeyboardButtonData("📂 فایل‌های آپلودی", "uploaded_files"),
+        ),
+        tgbotapi.NewInlineKeyboardRow(
+            tgbotapi.NewInlineKeyboardButtonData("❔ راهنما", "help"),
+        ),
+    )
 }
 
-func getUpdates() []Update {
-    url := fmt.Sprintf("%s/getUpdates?offset=%d&timeout=30", apiURL, offset+1)
-    resp, err := http.Get(url)
-    if err != nil {
-        return nil
-    }
-    defer resp.Body.Close()
+// ایجاد کیبورد مدیریت فایل
+func createFileManagerKeyboard(path string, isServerMode bool) tgbotapi.InlineKeyboardMarkup {
+    var buttons [][]tgbotapi.InlineKeyboardButton
 
-    var result struct {
-        Ok     bool     `json:"ok"`
-        Result []Update `json:"result"`
-    }
-    json.NewDecoder(resp.Body).Decode(&result)
-
-    if len(result.Result) > 0 {
-        offset = result.Result[len(result.Result)-1].UpdateID
+    // دکمه برگشت
+    if path != "" && path != uploadDir {
+        buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
+            tgbotapi.NewInlineKeyboardButtonData("⬅️ برگشت", "back:"+filepath.Dir(path)),
+        ))
     }
 
-    return result.Result
-}
-
-func createZipArchive(sourceDir, targetFile string) error {
-    zipfile, err := os.Create(targetFile)
-    if err != nil {
-        return err
-    }
-    defer zipfile.Close()
-
-    archive := zip.NewWriter(zipfile)
-    defer archive.Close()
-
-    return filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
-        if err != nil {
-            return err
+    // نمایش محتویات
+    files, _ := ioutil.ReadDir(path)
+    var rowButtons []tgbotapi.InlineKeyboardButton
+    for _, file := range files {
+        prefix := "📄 "
+        if file.IsDir() {
+            prefix = "📁 "
         }
-
-        header, err := zip.FileInfoHeader(info)
-        if err != nil {
-            return err
+        fullPath := filepath.Join(path, file.Name())
+        
+        button := tgbotapi.NewInlineKeyboardButtonData(
+            prefix+file.Name(),
+            "file:"+fullPath,
+        )
+        
+        rowButtons = append(rowButtons, button)
+        if len(rowButtons) == 2 {
+            buttons = append(buttons, rowButtons)
+            rowButtons = nil
         }
+    }
+    if len(rowButtons) > 0 {
+        buttons = append(buttons, rowButtons)
+    }
 
-        header.Name = strings.TrimPrefix(path, sourceDir)
-        if info.IsDir() {
-            header.Name += "/"
-        }
+    // دکمه‌های عملیات
+    if isServerMode {
+        buttons = append(buttons,
+            tgbotapi.NewInlineKeyboardRow(
+                tgbotapi.NewInlineKeyboardButtonData("📁 پوشه جدید", "newdir:"+path),
+                tgbotapi.NewInlineKeyboardButtonData("📄 فایل جدید", "newfile:"+path),
+            ),
+            tgbotapi.NewInlineKeyboardRow(
+                tgbotapi.NewInlineKeyboardButtonData("📤 آپلود", "upload:"+path),
+                tgbotapi.NewInlineKeyboardButtonData("❌ حذف", "delete:"+path),
+            ),
+        )
+    }
 
-        writer, err := archive.CreateHeader(header)
-        if err != nil {
-            return err
-        }
+    buttons = append(buttons,
+        tgbotapi.NewInlineKeyboardRow(
+            tgbotapi.NewInlineKeyboardButtonData("🔄 بروزرسانی", "refresh:"+path),
+            tgbotapi.NewInlineKeyboardButtonData("🏠 منوی اصلی", "home"),
+        ),
+    )
 
-        if !info.IsDir() {
-            file, err := os.Open(path)
-            if err != nil {
-                return err
-            }
-            defer file.Close()
-            _, err = io.Copy(writer, file)
-        }
-        return err
-    })
+    return tgbotapi.NewInlineKeyboardMarkup(buttons...)
 }
 
-func handleIncomingFile(update Update) {
-    chatID := update.Message.Chat.ID
-    module := userModules[chatID]
-
-    if module == "" {
-        sendMessage(chatID, "⚠️ Please activate a module first using /learn")
-        return
-    }
-
-    var file *File
-    var fileName string
-
-    switch {
-    case update.Message.Document != nil:
-        file = update.Message.Document
-        fileName = file.FileName
-    case len(update.Message.Photo) > 0:
-        file = &update.Message.Photo[len(update.Message.Photo)-1]
-        fileName = fmt.Sprintf("photo%d.jpg", time.Now().Unix())
-    case update.Message.Video != nil:
-        file = update.Message.Video
-        fileName = file.FileName
-    case update.Message.Audio != nil:
-        file = update.Message.Audio
-        fileName = file.FileName
-    case update.Message.Voice != nil:
-        file = update.Message.Voice
-        fileName = file.FileName
-    }
-
-    if file != nil {
-        saveFile(file.FileID, fileName, chatID, module)
-    }
-}
-
-func saveFile(fileID, fileName string, chatID int64, module string) {
-    filePath := filepath.Join(uploadDir, module, fileName)
-
-    path, err := getFilePath(fileID)
-    if err != nil {
-        sendMessage(chatID, "❌ Error getting file path")
-        return
-    }
-
-    fileURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", token, path)
-    resp, err := http.Get(fileURL)
-    if err != nil {
-        sendMessage(chatID, "❌ Error downloading file")
-        return
-    }
-    defer resp.Body.Close()
-
-    os.MkdirAll(filepath.Dir(filePath), 0755)
-    out, err := os.Create(filePath)
-    if err != nil {
-        sendMessage(chatID, "❌ Error saving file")
-        return
-    }
-    defer out.Close()
-
-    _, err = io.Copy(out, resp.Body)
-    if err != nil {
-        sendMessage(chatID, "❌ Error saving file")
-        return
-    }
-
-    sendMessage(chatID, fmt.Sprintf("✅ File %s saved successfully!", fileName))
-}
-
-func getFilePath(fileID string) (string, error) {
-    resp, err := http.Get(apiURL + "/getFile?file_id=" + fileID)
+// نمایش محتویات پوشه
+func listDirectory(path string) (string, error) {
+    files, err := ioutil.ReadDir(path)
     if err != nil {
         return "", err
     }
-    defer resp.Body.Close()
 
-    var result struct {
-        Ok     bool `json:"ok"`
-        Result struct {
-            FilePath string `json:"file_path"`
-        } `json:"result"`
+    var output strings.Builder
+    output.WriteString(fmt.Sprintf("📂 مسیر فعلی: %s\n\n", path))
+
+    var dirs []string
+    var filesList []string
+
+    for _, file := range files {
+        if file.IsDir() {
+            dirs = append(dirs, fmt.Sprintf("📁 %s/", file.Name()))
+        } else {
+            filesList = append(filesList, fmt.Sprintf("📄 %s (%s)", 
+                file.Name(), formatSize(file.Size())))
+        }
     }
 
-    err = json.NewDecoder(resp.Body).Decode(&result)
-    if err != nil || !result.Ok {
-        return "", fmt.Errorf("error getting file path")
+    if len(dirs) > 0 {
+        output.WriteString("📁 پوشه‌ها:\n")
+        output.WriteString(strings.Join(dirs, "\n"))
+        output.WriteString("\n\n")
     }
 
-    return result.Result.FilePath, nil
+    if len(filesList) > 0 {
+        output.WriteString("📄 فایل‌ها:\n")
+        output.WriteString(strings.Join(filesList, "\n"))
+    }
+
+    if len(dirs) == 0 && len(filesList) == 0 {
+        output.WriteString("📭 این پوشه خالی است.")
+    }
+
+    return output.String(), nil
 }
 
-func sendToAI(text string) string {
+// ارسال به GPT
+func sendToGPT(text string) (string, error) {
     url := "https://openrouter.ai/api/v1/chat/completions"
     payload := map[string]interface{}{
         "model": "openai/gpt-3.5-turbo",
@@ -231,17 +165,25 @@ func sendToAI(text string) string {
         },
     }
 
-    body, _ := json.Marshal(payload)
-    req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
-    req.Header.Set("Authorization", "Bearer "+openaiKey)
+    jsonData, err := json.Marshal(payload)
+    if err != nil {
+        return "", err
+    }
+
+    req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+    if err != nil {
+        return "", err
+    }
+
+    req.Header.Set("Authorization", "Bearer "+os.Getenv("OPENAI_API_KEY"))
     req.Header.Set("Content-Type", "application/json")
-    req.Header.Set("HTTP-Referer", "https://your-domain.com")
-    req.Header.Set("X-Title", "YourApp")
+    req.Header.Set("HTTP-Referer", "https://github.com/yourusername")
+    req.Header.Set("X-Title", "File Manager Bot")
 
     client := &http.Client{}
     resp, err := client.Do(req)
     if err != nil {
-        return "❌ Error connecting to AI"
+        return "", err
     }
     defer resp.Body.Close()
 
@@ -252,201 +194,339 @@ func sendToAI(text string) string {
             } `json:"message"`
         } `json:"choices"`
     }
-    json.NewDecoder(resp.Body).Decode(&result)
+
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return "", err
+    }
 
     if len(result.Choices) > 0 {
-        return result.Choices[0].Message.Content
+        return result.Choices[0].Message.Content, nil
     }
-    return "❌ No response from AI"
+    return "", fmt.Errorf("no response from GPT")
 }
 
-func handleCommand(chatID int64, command string, args []string) {
-    switch command {
-    case "/learn":
-        if len(args) < 1 {
-            sendMessage(chatID, "❗ لطفاً نام ماژول رو بنویس. مثلا: /learn Mohsen")
-            return
-        }
-        moduleName := args[0]
-        userModules[chatID] = moduleName
-        moduleDir := filepath.Join(uploadDir, moduleName)
-        if _, err := os.Stat(moduleDir); os.IsNotExist(err) {
-            os.MkdirAll(moduleDir, 0755)
-            sendMessage(chatID, fmt.Sprintf("✅ ماژول %s ایجاد و فعال شد!", moduleName))
-        } else {
-            sendMessage(chatID, fmt.Sprintf("✅ ماژول %s فعال شد!", moduleName))
-        }
+// مدیریت آپلود فایل
+func handleFileUpload(update tgbotapi.Update) {
+    chatID := update.Message.Chat.ID
+    state, exists := userStates[chatID]
+    if !exists || !strings.HasPrefix(state, "waiting_upload:") {
+        return
+    }
 
-    case "/mkdir":
-        if len(args) < 1 {
-            sendMessage(chatID, "❗ لطفاً نام پوشه رو بنویس. مثلا: /mkdir images")
-            return
-        }
-        folderName := args[0]
-        moduleName := userModules[chatID]
-        folderPath := filepath.Join(uploadDir, moduleName, folderName)
-        err := os.MkdirAll(folderPath, 0755)
+    path := strings.TrimPrefix(state, "waiting_upload:")
+    var fileID string
+    var fileName string
+
+    if update.Message.Document != nil {
+        fileID = update.Message.Document.FileID
+        fileName = update.Message.Document.FileName
+    } else if update.Message.Photo != nil && len(update.Message.Photo) > 0 {
+        photos := update.Message.Photo
+        fileID = photos[len(photos)-1].FileID
+        fileName = fmt.Sprintf("photo_%d.jpg", time.Now().Unix())
+    }
+
+    if fileID != "" {
+        file, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
         if err != nil {
-            sendMessage(chatID, fmt.Sprintf("❌ خطا در ایجاد پوشه: %s", folderName))
+            bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در دریافت فایل"))
             return
         }
-        sendMessage(chatID, fmt.Sprintf("✅ پوشه %s ایجاد شد!", folderName))
 
-    case "/touch":
-        if len(args) < 1 {
-            sendMessage(chatID, "❗ لطفاً نام فایل رو بنویس. مثلا: /touch note.txt")
-            return
-        }
-        fileName := args[0]
-        moduleName := userModules[chatID]
-        filePath := filepath.Join(uploadDir, moduleName, fileName)
-        _, err := os.Create(filePath)
+        resp, err := http.Get(file.Link(bot.Token))
         if err != nil {
-            sendMessage(chatID, fmt.Sprintf("❌ خطا در ایجاد فایل: %s", fileName))
+            bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در دانلود فایل"))
             return
         }
-        sendMessage(chatID, fmt.Sprintf("✅ فایل %s ایجاد شد!", fileName))
+        defer resp.Body.Close()
 
-    case "/save":
-        if len(args) < 2 {
-            sendMessage(chatID, "❗ لطفاً نام فایل و محتوای آن را بنویسید. مثلا: /save note.txt این یک تست است")
-            return
-        }
-        fileName := args[0]
-        content := strings.Join(args[1:], " ")
-        moduleName := userModules[chatID]
-        filePath := filepath.Join(uploadDir, moduleName, fileName)
-        err := os.WriteFile(filePath, []byte(content), 0644)
+        targetPath := filepath.Join(path, fileName)
+        out, err := os.Create(targetPath)
         if err != nil {
-            sendMessage(chatID, fmt.Sprintf("❌ خطا در ذخیره فایل: %s", fileName))
+            bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در ذخیره فایل"))
             return
         }
-        sendMessage(chatID, fmt.Sprintf("✅ فایل %s ذخیره شد!", fileName))
+        defer out.Close()
 
-    case "/read":
-        if len(args) < 1 {
-            sendMessage(chatID, "❗ لطفاً مسیر فایل را بنویسید. مثلا: /read Mohsen/note.txt")
-            return
-        }
-        filePath := filepath.Join(uploadDir, args[0])
-        content, err := os.ReadFile(filePath)
+        _, err = io.Copy(out, resp.Body)
         if err != nil {
-            sendMessage(chatID, fmt.Sprintf("❌ خطا در خواندن فایل: %s", args[0]))
+            bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در ذخیره فایل"))
             return
         }
 
-        if len(content) > 4096 {
-            sendDocument(chatID, filepath.Base(args[0]), filePath)
-        } else {
-            sendMessage(chatID, fmt.Sprintf("\n%s\n", string(content)))
+        delete(userStates, chatID)
+        msg := tgbotapi.NewMessage(chatID, "✅ فایل با موفقیت آپلود شد!")
+        msg.ReplyMarkup = createFileManagerKeyboard(path, true)
+        bot.Send(msg)
+    }
+}
+
+// مدیریت کالبک‌ها
+func handleCallback(update tgbotapi.Update) {
+    query := update.CallbackQuery
+    chatID := query.Message.Chat.ID
+    data := query.Data
+
+    parts := strings.SplitN(data, ":", 2)
+    action := parts[0]
+    var path string
+    if len(parts) > 1 {
+        path = parts[1]
+    }
+
+    switch action {
+    case "gpt_start":
+        isGPTMode[chatID] = true
+        msg := tgbotapi.NewMessage(chatID, "✅ حالت Chat GPT فعال شد!\n🤖 پیام خود را بنویسید...")
+        bot.Send(msg)
+
+    case "gpt_exit":
+        delete(isGPTMode, chatID)
+        msg := tgbotapi.NewMessage(chatID, "✅ از حالت Chat GPT خارج شدید!")
+        msg.ReplyMarkup = createMainKeyboard()
+        bot.Send(msg)
+
+    case "server_files":
+        msg := tgbotapi.NewMessage(chatID, "📂 مدیریت فایل‌های سرور:")
+        msg.ReplyMarkup = createFileManagerKeyboard("/", true)
+        bot.Send(msg)
+
+    case "uploaded_files":
+        msg := tgbotapi.NewMessage(chatID, "📂 فایل‌های آپلود شده:")
+        msg.ReplyMarkup = createFileManagerKeyboard(uploadDir, false)
+        bot.Send(msg)
+
+    case "file":
+        if stat, err := os.Stat(path); err == nil {
+            if stat.IsDir() {
+                content, err := listDirectory(path)
+                if err != nil {
+                    bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در خواندن محتویات پوشه"))
+                    return
+                }
+                msg := tgbotapi.NewMessage(chatID, content)
+                msg.ReplyMarkup = createFileManagerKeyboard(path, !strings.HasPrefix(path, uploadDir))
+                bot.Send(msg)
+            } else {
+                // ارسال فایل با نوع مناسب
+                ext := strings.ToLower(filepath.Ext(path))
+                switch ext {
+                case ".jpg", ".jpeg", ".png", ".gif":
+                    photo := tgbotapi.NewPhoto(chatID, tgbotapi.FilePath(path))
+                    bot.Send(photo)
+                case ".mp4", ".avi", ".mkv":
+                    video := tgbotapi.NewVideo(chatID, tgbotapi.FilePath(path))
+                    bot.Send(video)
+                case ".mp3", ".wav", ".ogg":
+                    audio := tgbotapi.NewAudio(chatID, tgbotapi.FilePath(path))
+                    bot.Send(audio)
+                default:
+                    doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(path))
+                    bot.Send(doc)
+                }
+
+                // نمایش اطلاعات فایل
+                info := fmt.Sprintf(`
+📄 نام فایل: %s
+📦 حجم: %s
+📅 تاریخ ویرایش: %s
+`,
+                    stat.Name(),
+                    formatSize(stat.Size()),
+                    stat.ModTime().Format("2006-01-02 15:04:05"),
+                )
+                msg := tgbotapi.NewMessage(chatID, info)
+                bot.Send(msg)
+            }
         }
 
-    case "/generate":
-        if len(args) < 1 {
-            sendMessage(chatID, "❗ لطفاً نام ماژول را بنویسید. مثلا: /generate Mohsen")
-            return
-        }
-        moduleName := args[0]
-        sourceDir := filepath.Join(uploadDir, moduleName)
-
-        if _, err := os.Stat(sourceDir); os.IsNotExist(err) {
-            sendMessage(chatID, "❌ ماژول پیدا نشد!")
-            return
-        }
-
-        zipFile := moduleName + ".zip"
-        zipPath := filepath.Join(uploadDir, zipFile)
-
-        err := createZipArchive(sourceDir, zipPath)
+    case "back":
+        content, err := listDirectory(path)
         if err != nil {
-            sendMessage(chatID, "❌ خطا در ساخت فایل ZIP")
+            bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در خواندن محتویات پوشه"))
             return
         }
+        msg := tgbotapi.NewMessage(chatID, content)
+        msg.ReplyMarkup = createFileManagerKeyboard(path, !strings.HasPrefix(path, uploadDir))
+        bot.Send(msg)
 
-        sendDocument(chatID, zipFile, zipPath)
-        os.Remove(zipPath)
+    case "refresh":
+        content, err := listDirectory(path)
+        if err != nil {
+            bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در بروزرسانی"))
+            return
+        }
+        msg := tgbotapi.NewMessage(chatID, content)
+        msg.ReplyMarkup = createFileManagerKeyboard(path, !strings.HasPrefix(path, uploadDir))
+        bot.Send(msg)
 
-    case "/chat":
-        userStates[chatID] = true
-        sendMessage(chatID, "💬 شما در حالت گفتگو با AI هستید. برای خروج از حالت گفتگو /exit را بفرستید.")
+    case "home":
+        msg := tgbotapi.NewMessage(chatID, "🏠 منوی اصلی")
+        msg.ReplyMarkup = createMainKeyboard()
+        bot.Send(msg)
 
-    case "/exit":
-        userStates[chatID] = false
-        sendMessage(chatID, "👋 شما از حالت گفتگو خارج شدید.")
+    case "newdir":
+        userStates[chatID] = "waiting_mkdir:" + path
+        msg := tgbotapi.NewMessage(chatID, "📁 نام پوشه جدید را وارد کنید:")
+        bot.Send(msg)
 
-    case "/help":
-        helpText := "🛠 راهنمای دستورات:\n" +
-            "- /learn <module_name> → فعال‌سازی ماژول\n" +
-            "- /mkdir <folder_name> → ایجاد پوشه\n" +
-            "- /touch <file_name> → ایجاد فایل خالی\n" +
-            "- /save <file_name> <content> → ذخیره متن در فایل\n" +
-            "- /read <file_path> → خواندن محتوای فایل\n" +
-            "- /generate <module_name> → دریافت فایل ZIP\n" +
-            "- /chat → شروع چت با AI\n" +
-            "- /exit → خروج از گفتگو با AI\n" +
-            "- /help → نمایش این راهنما"
+    case "newfile":
+        userStates[chatID] = "waiting_touch:" + path
+        msg := tgbotapi.NewMessage(chatID, "📄 نام فایل جدید را وارد کنید:")
+        bot.Send(msg)
+
+    case "upload":
+        userStates[chatID] = "waiting_upload:" + path
+        msg := tgbotapi.NewMessage(chatID, "📤 فایل مورد نظر را ارسال کنید:")
+        bot.Send(msg)
+
+    case "delete":
+        msg := tgbotapi.NewMessage(chatID, "⚠️ آیا از حذف این مورد اطمینان دارید؟")
+        keyboard := tgbotapi.NewInlineKeyboardMarkup(
+            tgbotapi.NewInlineKeyboardRow(
+                tgbotapi.NewInlineKeyboardButtonData("✅ بله", "confirm_delete:"+path),
+                tgbotapi.NewInlineKeyboardButtonData("❌ خیر", "cancel_delete:"+path),
+            ),
+        )
+        msg.ReplyMarkup = keyboard
+        bot.Send(msg)
+
+    case "confirm_delete":
+        err := os.RemoveAll(path)
+        if err != nil {
+            bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در حذف فایل/پوشه"))
+            return
+        }
+        msg := tgbotapi.NewMessage(chatID, "✅ با موفقیت حذف شد!")
+        parentDir := filepath.Dir(path)
+        msg.ReplyMarkup = createFileManagerKeyboard(parentDir, !strings.HasPrefix(parentDir, uploadDir))
+        bot.Send(msg)
+
+    case "cancel_delete":
+        msg := tgbotapi.NewMessage(chatID, "❌ عملیات حذف لغو شد.")
+        msg.ReplyMarkup = createFileManagerKeyboard(filepath.Dir(path), !strings.HasPrefix(path, uploadDir))
+        bot.Send(msg)
+
+    case "help":
+        helpText := `
+📚 راهنمای دستورات:
+
+🤖 Chat GPT:
+• شروع گفتگو با دکمه Chat GPT
+• خروج با دکمه خروج از GPT
+
+📁 مدیریت فایل سرور:
+• مرور و مدیریت فایل‌های سرور
+• ایجاد پوشه و فایل جدید
+• آپلود و دانلود فایل
+• حذف فایل و پوشه
+
+📂 فایل‌های آپلودی:
+• مشاهده فایل‌های آپلود شده
+• دانلود فایل‌ها
+• حذف فایل‌ها
+
+⚡️ دستورات:
+/start - شروع مجدد ربات
+/help - نمایش این راهنما`
 
         msg := tgbotapi.NewMessage(chatID, helpText)
+        msg.ReplyMarkup = createMainKeyboard()
+        bot.Send(msg)
+    }
+}
+
+// مدیریت ورودی کاربر
+func handleUserInput(update tgbotapi.Update) {
+    chatID := update.Message.Chat.ID
+    state, exists := userStates[chatID]
+    if !exists {
+        return
+    }
+
+    if strings.HasPrefix(state, "waiting_mkdir:") {
+        path := strings.TrimPrefix(state, "waiting_mkdir:")
+        newPath := filepath.Join(path, update.Message.Text)
+        err := os.MkdirAll(newPath, 0755)
+        if err != nil {
+            bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در ایجاد پوشه"))
+            return
+        }
+
+        delete(userStates, chatID)
+        msg := tgbotapi.NewMessage(chatID, "✅ پوشه با موفقیت ایجاد شد!")
+        msg.ReplyMarkup = createFileManagerKeyboard(path, true)
+        bot.Send(msg)
+
+    } else if strings.HasPrefix(state, "waiting_touch:") {
+        path := strings.TrimPrefix(state, "waiting_touch:")
+        newPath := filepath.Join(path, update.Message.Text)
+        _, err := os.Create(newPath)
+        if err != nil {
+            bot.Send(tgbotapi.NewMessage(chatID, "❌ خطا در ایجاد فایل"))
+            return
+        }
+
+        delete(userStates, chatID)
+        msg := tgbotapi.NewMessage(chatID, "✅ فایل با موفقیت ایجاد شد!")
+        msg.ReplyMarkup = createFileManagerKeyboard(path, true)
         bot.Send(msg)
     }
 }
 
 func main() {
-    fmt.Println("🚀 Bot started...")
-
-    for {
-        updates := getUpdates()
-        for _, update := range updates {
-            chatID := update.Message.Chat.ID
-            if update.Message.Text != "" {
-                if strings.HasPrefix(update.Message.Text, "/") {
-                    parts := strings.Fields(update.Message.Text)
-                    command := parts[0]
-                    args := parts[1:]
-                    handleCommand(chatID, command, args)
-                } else {
-                    if userStates[chatID] {
-                        response := sendToAI(update.Message.Text)
-                        sendMessage(chatID, response)
-                    } else {
-                        sendMessage(chatID, "⚠️ برای گفتگو با AI از دستور /chat استفاده کنید.")
-                    }
-                }
-            } else {
-                handleIncomingFile(update)
-            }
-        }
-        time.Sleep(time.Second)
-    }
-}
-
-func init() {
+    // خواندن تنظیمات از فایل .env
     err := godotenv.Load()
     if err != nil {
-        fmt.Println("Error loading .env file")
-        os.Exit(1)
+        log.Fatal("Error loading .env file")
     }
 
-    token = os.Getenv("BOT_TOKEN")
-    openaiKey = os.Getenv("OPENAI_API_KEY")
-    uploadDir = os.Getenv("UPLOAD_DIR")
-    templateDir = os.Getenv("TEMPLATE_DIR")
-
-    if token == "" || openaiKey == "" || uploadDir == "" || templateDir == "" {
-        fmt.Println("Missing required environment variables")
-        os.Exit(1)
-    }
-
+    // ساخت پوشه آپلود
     os.MkdirAll(uploadDir, 0755)
-    os.MkdirAll(templateDir, 0755)
 
-    apiURL = "https://api.telegram.org/bot" + token
-
-    botErr, err := tgbotapi.NewBotAPI(token)
+    // راه‌اندازی ربات
+    bot, err = tgbotapi.NewBotAPI(os.Getenv("BOT_TOKEN"))
     if err != nil {
-        fmt.Println("Error initializing bot:", err)
-        os.Exit(1)
+        log.Fatal(err)
     }
-    bot = botErr
+
+    fmt.Printf("🤖 ربات با نام %s راه‌اندازی شد!\n", bot.Self.UserName)
+
+    updateConfig := tgbotapi.NewUpdate(0)
+    updateConfig.Timeout = 60
+
+    updates := bot.GetUpdatesChan(updateConfig)
+
+    for update := range updates {
+        if update.CallbackQuery != nil {
+            handleCallback(update)
+        } else if update.Message != nil {
+            chatID := update.Message.Chat.ID
+
+            if update.Message.IsCommand() {
+                if update.Message.Command() == "start" {
+                    msg := tgbotapi.NewMessage(chatID, "👋 خوش آمدید!\nلطفاً یکی از گزینه‌های زیر را انتخاب کنید:")
+                    msg.ReplyMarkup = createMainKeyboard()
+                    bot.Send(msg)
+                    continue
+                }
+            } else if update.Message.Document != nil || update.Message.Photo != nil {
+                handleFileUpload(update)
+            } else if update.Message.Text != "" {
+                if isGPTMode[chatID] {
+                    response, err := sendToGPT(update.Message.Text)
+                    if err != nil {
+                        msg := tgbotapi.NewMessage(chatID, "❌ خطا در ارتباط با GPT")
+                        bot.Send(msg)
+                        continue
+                    }
+                    msg := tgbotapi.NewMessage(chatID, response)
+                    bot.Send(msg)
+                } else {
+                    handleUserInput(update)
+                }
+            }
+        }
+    }
 }
 
